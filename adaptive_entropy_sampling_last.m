@@ -2,18 +2,20 @@
 % Entropy-driven adaptive sampling atop the WFPV (TBME2017) pipeline.
 % Two modes: fs_hi=25 Hz, fs_lo=6.25 Hz. Raw data assumed at fs0=125 Hz.
 
-clear; % reset workspace before running script
+clearvars; % Clears all variables from the workspace
+%clc;       % Clears the command window
+close all; % Closes all figure windows
 
 %% Configuration
 fs0 = 125;
 fs_hi = 25;
-fs_lo = 6.25;
-fs_proc = 25;             % internal WFPV processing rate (matches original)
-FORCE_LOW = false;         % set true to lock controller to LOW for baseline comparison
+fs_lo = 50;
+fs_proc = 125;             % internal WFPV processing rate (matches original)
+FORCE_LOW = true;         % set true to lock controller to LOW for baseline comparison
 fs_acc = 25;              % fixed-rate control stream for ACC
 FFTres = 1024;
 WFlength = 15;            % Wiener averaging length (frames)
-CutoffFreqHzBP = [0.4 3];     % bandpass at 125 Hz before decimation (Nyquist at 3.125 Hz)
+CutoffFreqHzBP = [0.4 4];     % bandpass at 125 Hz before decimation (Nyquist at 3.125 Hz)
 CutoffFreqHzSearch = [1 3];   % HR search band (Hz)
 window_sec = 8;
 step_sec = 2;
@@ -34,9 +36,6 @@ IDData = {'DATA_01_TYPE01','DATA_02_TYPE02','DATA_03_TYPE02','DATA_04_TYPE02',..
     'TEST_S01_T01', 'TEST_S02_T01', 'TEST_S02_T02', 'TEST_S03_T02', ...
     'TEST_S04_T02', 'TEST_S05_T02', 'TEST_S06_T01', 'TEST_S06_T02',...
     'TEST_S07_T02', 'TEST_S08_T01'};
-
-%% Filter at original rate (reuse per recording)
-[b125, a125] = butter(4, CutoffFreqHzBP/(fs0/2), 'bandpass');
 
 %% Metrics containers
 logRec = struct([]);
@@ -98,7 +97,8 @@ for idnb = 1:numel(IDData)
         end
 
         % 2) process HR in this frame using current mode
-        [BPM_est(i), state_out] = WFPV_bb.wfpv_one_frame_last(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
+        [BPM_est(i), state_out] = WFPV_bb.simple_hr_one_frame_last(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
+        % [BPM_est(i), state_out] = WFPV_bb.wfpv_one_frame_last(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
 
         % 3) Save back mode state
         if fs_cur == fs_hi
@@ -107,14 +107,16 @@ for idnb = 1:numel(IDData)
             state_lo = state_out;
         end
 
+        %% Filter at original rate (reuse per recording)
+        [b125, a125] = butter(4, [0.3 8]/(fs0/2), 'bandpass');
         % 4) Filter ACC at 125 Hz before downsampling
-        curDataFilt2 = zeros(size(curDataRaw));
-        for c = 1:size(curDataRaw,1)
+        curDataFilt2 = curDataRaw;
+        for c = 3:size(curDataRaw,1)
             curDataFilt2(c,:) = filter(b125, a125, curDataRaw(c,:));
         end
 
         % 5) ACC control stream at fixed 25 Hz for entropy calculation
-        curAcc_resampled = do_resample_last(curDataFilt2(3:5, :), fs0, fs_acc);
+        curAcc_resampled = do_resample_last(curDataFilt2, fs0, fs_acc);
         ACCmag25 = sqrt(curAcc_resampled(1,:).^2 + curAcc_resampled(2,:).^2 + curAcc_resampled(3,:).^2);
         ACCmag25_log(i) = mean(ACCmag25);
         Hacc(i) = entropy_proxy_hist(ACCmag25, nbits_entropy);
@@ -123,6 +125,16 @@ for idnb = 1:numel(IDData)
         else
             dHacc(i) = Hacc(i) - Hacc(i-1);
         end
+
+        % % 5) ACC control stream at fixed 125 Hz for entropy calculation
+        % ACCmag25 = sqrt(curDataFilt2(1,:).^2 + curDataFilt2(2,:).^2 + curDataFilt2(3,:).^2);
+        % ACCmag25_log(i) = mean(ACCmag25);
+        % Hacc(i) = entropy_proxy_hist(ACCmag25, nbits_entropy);
+        % if i == 1
+        %     dHacc(i) = 0;
+        % else
+        %     dHacc(i) = Hacc(i) - Hacc(i-1);
+        % end
 
         % 6) Adaptive sampling controller logic (simple hysteresis on entropy jumps)
         i0 = max(1, i - N_look_back + 1);
@@ -263,4 +275,5 @@ state.W2_FFTi = [];
 state.W21_FFTi = [];
 state.prevFFT = [];
 state.rangeIdx = [];
+state.FreqRange = [];
 end
