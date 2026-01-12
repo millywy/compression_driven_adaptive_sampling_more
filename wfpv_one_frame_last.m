@@ -1,9 +1,10 @@
 function [BPM_val, state] = wfpv_one_frame_last(curDataRaw, fs0, fs_adc, fs_proc, FFTres, WFlength, searchHz, state, i, BPM_est, idnb, bpHz)
+
 % Bandpass at 125 Hz, resample to fs_adc, then to 25 Hz internal, then run original WFPV logic
 [b,a] = butter(4, bpHz/(fs0/2), 'bandpass');
 curDataFilt = zeros(size(curDataRaw));
 for c = 1:size(curDataRaw,1)
-    curDataFilt(c,:) = filter(b,a,curDataRaw(c,:));
+    curDataFilt(c,:) = filtfilt(b,a,curDataRaw(c,:));
 end
 % resample to fs_adc
 curData_adc = do_resample_last(curDataFilt, fs0, fs_adc);

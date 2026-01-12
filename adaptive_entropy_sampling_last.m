@@ -2,15 +2,14 @@
 % Entropy-driven adaptive sampling atop the WFPV (TBME2017) pipeline.
 % Two modes: fs_hi=25 Hz, fs_lo=6.25 Hz. Raw data assumed at fs0=125 Hz.
 
-clearvars; % Clears all variables from the workspace
-%clc;       % Clears the command window
+clear;
 close all; % Closes all figure windows
 
 %% Configuration
-fs0 = 125;
+fs0 = 125;               % original sampling rate
 fs_hi = 25;
-fs_lo = 50;
-fs_proc = 125;             % internal WFPV processing rate (matches original)
+fs_lo = 12.5;
+fs_proc = 25;             % internal WFPV processing rate (matches original)
 FORCE_LOW = true;         % set true to lock controller to LOW for baseline comparison
 fs_acc = 25;              % fixed-rate control stream for ACC
 FFTres = 1024;
@@ -97,7 +96,7 @@ for idnb = 1:numel(IDData)
         end
 
         % 2) process HR in this frame using current mode
-        [BPM_est(i), state_out] = WFPV_bb.simple_hr_one_frame_last(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
+        [BPM_est(i), state_out] = WFPV_bb.simple_pd_hr_one_frame(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
         % [BPM_est(i), state_out] = WFPV_bb.wfpv_one_frame_last(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
 
         % 3) Save back mode state

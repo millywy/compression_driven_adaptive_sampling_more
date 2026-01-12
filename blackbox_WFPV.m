@@ -1,0 +1,440 @@
+% Authors: Andriy Temko, INFANT Research Centre
+% http://www.infantcentre.ie/
+% http://eleceng.ucc.ie/~andreyt/
+
+
+clear; %close all;
+
+% Dataset IDs
+IDData = {'DATA_01_TYPE01','DATA_02_TYPE02','DATA_03_TYPE02','DATA_04_TYPE02',...
+    'DATA_05_TYPE02','DATA_06_TYPE02','DATA_07_TYPE02','DATA_08_TYPE02','DATA_09_TYPE02',...
+    'DATA_10_TYPE02','DATA_11_TYPE02','DATA_12_TYPE02','DATA_S04_T01',...
+    'TEST_S01_T01', 'TEST_S02_T01', 'TEST_S02_T02', 'TEST_S03_T02', ...
+    'TEST_S04_T02', 'TEST_S05_T02', 'TEST_S06_T01', 'TEST_S06_T02',...
+    'TEST_S07_T02', 'TEST_S08_T01'};
+
+% Overall parameters
+srate = 125;    % original sampling rate
+FFTres = 1024;   % FFT resolution - user tunable parm1
+WFlength = 15; % Wiener filter length - - user tunable parm2
+allD = size(IDData,2); % number of recordings
+
+% Filter parameters
+CutoffFreqHzHP = 1; % 60 BPM;
+CutoffFreqHzLP = 3;% 180 BPM
+[b,a] = butter(4, [0.4 3]/(125/2),'bandpass');
+
+% metrics
+fullBPM=[];fullBPM0=[]; % for computing the correlation
+myError = zeros(1,allD); % Beat per Minute errors
+myErrorStd = zeros(1,allD); % std error
+myRelError = zeros(1,allD); % relative error
+
+% framework rule, 8s window 2s shift, no look into future
+window   = 8 * srate;  % window length is 8 seconds
+step     = 2 * srate;  % step size is 2 seconds
+
+%% Configuration
+fs0 = 125;               % original sampling rate
+fs_hi = 25;
+fs_lo = 6.25;
+fs_proc = 25;             % internal WFPV processing rate (matches original)
+FORCE_LOW = false;         % set true to lock controller to LOW for baseline comparison
+
+% % Adaptive entropy thresholds / hysteresis (tunable, should be parametrizable)
+% nbits_entropy = 2;            % quantization for entropy proxy
+% hi_hold = 20;                 % min windows to stay high after going HIGH
+% Th_hi = 0.15;                  % unstable = above this
+% N_look_back = 7;               % windows to look back for stable entropy
+% N_unstable = 2;                % unstable windows to go HIGH
+% Th_low = 0.13;                 % stable = below this
+% N_stable  = 5;                % min stable windows in high before going LOW
+
+
+%% Metrics containers
+logRec = struct([]);
+myError = nan(1, numel(IDData));
+
+
+%% loop for each recording
+for idnb = 1 : allD
+       
+    % load the data
+    load(['Data/' IDData{idnb}]);
+    if idnb>13
+        ch1 = 1; ch2 = 2; ch3 = 3; ch4 = 4; ch5 = 5;
+    else
+        ch1 = 2; ch2 = 3; ch3 = 4; ch4 = 5; ch5 = 6;
+    end
+    windowNb = floor((length(sig)-window)/step) + 1;  % total number of windows(estimates)
+    
+    % initialization of variables
+    BPM_est = zeros(1,windowNb); % estimated BPM
+    FsUsed  = zeros(1, windowNb);
+    Hacc    = zeros(1, windowNb);          % ACC entropy at fixed 25 Hz
+    dHacc = zeros(1, windowNb);            % ACC entropy diff (jump metric)
+    ACCmag25_log = zeros(1, windowNb);     % mean ACC magnitude per window
+    rangeIdx = []; % range of search for the next estimates
+    clear W1_FFTi W11_FFTi W2_FFTi W21_FFTi W1_PPG_ave_FFT_Clean W2_PPG_ave_FFT_Clean W11_PPG_ave_FFT_Clean PPG_ave_FFT_FIN W21_PPG_ave_FFT_Clean PPG_ave_FFT_FIN;
+
+    % Mode states (keep WF history per mode so HIGH/LOW do not mix)
+    state_hi = init_mode_state();
+    state_lo = init_mode_state();
+    state_in = init_mode_state();
+    state_out = init_mode_state();
+    fs_adc = fs_lo;                 % start low
+    fs_next = fs_lo;
+    state_mode = "LOW";             % start low
+    hi_timer = 0;                   % tracks how long we must stay HIGH
+    
+    %% loop each window
+    for i =  [1 :  windowNb]
+        curSegment = (i-1)*step+1 : (i-1)*step+window;
+        curDataRaw = sig(:,curSegment);
+
+        % 1) bandpass at 125 Hz, downsample to fs_adc, then resample to fs_proc
+        [b,a] = butter(4, [CutoffFreqHzHP CutoffFreqHzLP]/(fs0/2), 'bandpass');
+        curDataFilt = zeros(size(curDataRaw));
+        for c = 1:size(curDataRaw,1)
+            curDataFilt(c,:) = filter(b,a,curDataRaw(c,:));
+        end
+
+        % downsample to fs_adc if needed
+        if abs(fs0 - fs_adc) < eps
+            curData_adc = curDataFilt; 
+            %fs = fs_proc;
+        else
+            curData_adc = do_resample_last(curDataFilt, fs0, fs_adc);
+            %fs = fs_proc;
+        end
+
+        % resample to internal if needed
+        if abs(fs_adc - fs_proc) < eps
+            curData = curData_adc; fs = fs_proc;
+        else
+            curData = do_resample_last(curData_adc, fs_adc, fs_proc);
+            fs = fs_proc;
+        end
+
+        % 2)load in correct mode state
+        if fs_adc == fs_hi
+            state_in = state_hi;
+        else
+            state_in = state_lo;
+        end
+
+        W1_FFTi = state_in.W1_FFTi;
+        W11_FFTi = state_in.W11_FFTi;
+        W2_FFTi = state_in.W2_FFTi;
+        W21_FFTi = state_in.W21_FFTi;
+        PPG_ave_FFTpr = state_in.prevFFT;
+        rangeIdx = state_in.rangeIdx;
+
+
+        % 3) process HR in this frame using current mode, newDatacur
+        
+        PPG1 = curData(ch1,:); PPG2 = curData(ch2,:);
+        ACC_X = curData(ch3,:); ACC_Y = curData(ch4,:); ACC_Z = curData(ch5,:);
+        
+        % % filtering
+        % PPG1 = filter(b,a,PPG1);
+        % PPG2 = filter(b,a,PPG2);
+        % ACC_X = filter(b,a,ACC_X);
+        % ACC_Y = filter(b,a,ACC_Y);
+        % ACC_Z = filter(b,a,ACC_Z);
+        PPG_ave = 0.5*(PPG1-mean(PPG1))/(std(PPG1))+0.5*(PPG2-mean(PPG2))/(std(PPG2)); % mean overall
+        
+        % % downsampling to 25Hz
+        % PPG_ave = downsample(PPG_ave,5);
+        % ACC_X = downsample(ACC_X,5);
+        % ACC_Y = downsample(ACC_Y,5);
+        % ACC_Z = downsample(ACC_Z,5);
+        srate = 25; % new sampling rate
+        
+        % Periodogram
+        PPG_ave_FFT = fft(PPG_ave,FFTres);
+        FreqRange = linspace(0,srate,size(PPG_ave_FFT,2));
+        
+        % finding the indices for the range of interest
+        [extra,lowR] = (min(abs(FreqRange-CutoffFreqHzHP)));
+        [extra,highR] = (min(abs(FreqRange-CutoffFreqHzLP)));
+        
+        %  Getting rid of most spectra outside the range of interest
+        FreqRange = FreqRange(lowR:highR);
+        PPG_ave_FFT = PPG_ave_FFT(lowR:highR);
+        ACC_X_FFT= fft(ACC_X,FFTres); ACC_X_FFT = ACC_X_FFT(lowR:highR);
+        ACC_Y_FFT= fft(ACC_Y,FFTres); ACC_Y_FFT = ACC_Y_FFT(lowR:highR);
+        ACC_Z_FFT= fft(ACC_Z,FFTres); ACC_Z_FFT = ACC_Z_FFT(lowR:highR);
+        
+        
+        % phase vocoder to refine spectral estimations
+        FreqRangePPG = FreqRange;
+        if ~isempty(state_in.prevFFT) && length(state_in.prevFFT) == length(PPG_ave_FFT)
+        % if i>1 % start phase vocoder for current and previous frames
+            for ii=1:size(FreqRangePPG,2)
+                curPhase = angle(PPG_ave_FFT(ii));
+                prevPhase = angle(PPG_ave_FFTpr(ii)); vocoder = zeros(1,20);
+                for n = 1:20
+                    vocoder(n) = ((curPhase-prevPhase)+(2*pi*(n-1)))/(2*pi*2);
+                end
+                difference = vocoder - FreqRange(ii);
+                [extra, deltaidx] = min(abs(difference));
+                FreqRangePPG(ii) = vocoder(deltaidx);
+            end
+        end
+        
+        % smooth phase vocoder frequency estimates
+        FreqRangePPG = moving(FreqRangePPG,3);
+        
+        % save previous spectrum for the next phase vocoder call
+        PPG_ave_FFTpr = PPG_ave_FFT;
+        
+        
+        % Wiener filtering PPG-ACC, two types
+        % WF1 = 1 - (ACC_norm ./ PPG_hist_norm);
+        % WF2 = PPG_hist_norm ./ (PPG_hist_norm + ACC_norm);
+        % PPG_ave_FFT_FIN = W1_clean + W2_clean;
+        %
+        % W1 filter = clean_signal/(clean_signal+noise) = (all_signal-noise)/all_signal,
+        % where all_signal = time_average(ppg_signal), noise = time_average(accelerometer)
+        %
+        % W2 filter = clean_signal/(clean_signal+noise),
+        % where clean_signal = time_average(clean_ppg_signal), noise =
+        % time_average(accelerometer)
+        %
+        % The process of Wiener filtering:
+        % 1. Estimate the 'signal'/'clean_signal' level as average over
+        %    past 15 spectral envelopes (~30s)
+        % 2. Scale the spectrum of noise and signal/clean_signal
+        % 3. Apply the filter as weighting of the spectral components
+        
+
+        WC1 = WFlength; WC2 = WFlength;
+        
+        %Wiener 1 / abs & normalised
+        W1_FFTi(i,:) = (abs(PPG_ave_FFT))/max(abs(PPG_ave_FFT));
+        if i==1, W1_PPG_ave_FFT_ALL = W1_FFTi(i,:); else W1_PPG_ave_FFT_ALL = mean(W1_FFTi(max(1,i-WC1):i,:),1); end
+        W1_PPG_ave_FFT_ALL_norm = (W1_PPG_ave_FFT_ALL)/max(W1_PPG_ave_FFT_ALL);
+        W1_ACC_X_FFT_norm = (abs(ACC_X_FFT))/max(abs(ACC_X_FFT));
+        W1_ACC_Y_FFT_norm = (abs(ACC_Y_FFT))/max(abs(ACC_Y_FFT));
+        W1_ACC_Z_FFT_norm = (abs(ACC_Z_FFT))/max(abs(ACC_Z_FFT));
+        WF1 = (1 - 1/3*(W1_ACC_X_FFT_norm+W1_ACC_Y_FFT_norm+W1_ACC_Z_FFT_norm)./(W1_PPG_ave_FFT_ALL_norm)); 
+        WF1 (WF1<0) = -1; % limit negative -inf to -1
+        W1_PPG_ave_FFT_Clean(i,:) = abs(PPG_ave_FFT).*WF1;
+        
+        % Wiener 1, power2, works better on its own but not in ensemble
+        W11_FFTi(i,:) = abs(PPG_ave_FFT).^2;
+        if i==1, W11_PPG_ave_FFT_ALL = W11_FFTi(i,:); else W11_PPG_ave_FFT_ALL = mean(W11_FFTi(max(1,i-WC1):i,:),1); end
+        W11_PPG_ave_FFT_ALL_norm = (W11_PPG_ave_FFT_ALL)/max(W11_PPG_ave_FFT_ALL);
+        W11_ACC_X_FFT_norm = (abs(ACC_X_FFT).^2)/max(abs(ACC_X_FFT.^2));
+        W11_ACC_Y_FFT_norm = (abs(ACC_Y_FFT).^2)/max(abs(ACC_Y_FFT).^2);
+        W11_ACC_Z_FFT_norm = (abs(ACC_Z_FFT).^2)/max(abs(ACC_Z_FFT).^2);
+        WF11 = (1 - 1/3*(W11_ACC_X_FFT_norm+W11_ACC_Y_FFT_norm+W11_ACC_Z_FFT_norm)./(W11_PPG_ave_FFT_ALL_norm)); 
+        W11_PPG_ave_FFT_Clean(i,:) = abs(PPG_ave_FFT).*(WF11);
+        
+        %Wiener 2, abs & normalised
+        W2_FFTi(i,:) = (abs(PPG_ave_FFT))/max(abs(PPG_ave_FFT));
+        if i==1, W2_PPG_ave_FFT_ALL = W2_FFTi(i,:); else W2_PPG_ave_FFT_ALL = mean(W2_FFTi(max(1,i-WC2):i,:),1); end
+        W2_PPG_ave_FFT_ALL_norm = (W2_PPG_ave_FFT_ALL)/max(W2_PPG_ave_FFT_ALL);
+        W2_ACC_X_FFT_norm = (abs(ACC_X_FFT))/max(abs(ACC_X_FFT));
+        W2_ACC_Y_FFT_norm = (abs(ACC_Y_FFT))/max(abs(ACC_Y_FFT));
+        W2_ACC_Z_FFT_norm = (abs(ACC_Z_FFT))/max(abs(ACC_Z_FFT));
+        WF2 = W2_PPG_ave_FFT_ALL_norm./(((W2_ACC_X_FFT_norm+W2_ACC_Y_FFT_norm+W2_ACC_Z_FFT_norm)/3)+W2_PPG_ave_FFT_ALL_norm); 
+        W2_PPG_ave_FFT_Clean(i,:) = abs(PPG_ave_FFT).*WF2;
+        W2_FFTi(i,:) = (W2_PPG_ave_FFT_Clean(i,:))/max(W2_PPG_ave_FFT_Clean(i,:));
+        
+        %Wiener 2, power2, work better on its own, but not in ensemble
+        W21_FFTi(i,:) = abs(PPG_ave_FFT).^2;
+        if i==1, W21_PPG_ave_FFT_ALL = W21_FFTi(i,:); else W21_PPG_ave_FFT_ALL = mean(W21_FFTi(max(1,i-WC2):i,:),1); end
+        W21_PPG_ave_FFT_ALL_norm = W21_PPG_ave_FFT_ALL/max(W21_PPG_ave_FFT_ALL);
+        W21_ACC_X_FFT_norm = abs(ACC_X_FFT).^2/max(abs(ACC_X_FFT).^2);
+        W21_ACC_Y_FFT_norm = abs(ACC_Y_FFT).^2/max(abs(ACC_Y_FFT).^2);
+        W21_ACC_Z_FFT_norm = abs(ACC_Z_FFT).^2/max(abs(ACC_Z_FFT).^2);
+        WF21 = W21_PPG_ave_FFT_ALL_norm./(((W21_ACC_X_FFT_norm+W21_ACC_Y_FFT_norm+W21_ACC_Z_FFT_norm)/3)+W21_PPG_ave_FFT_ALL_norm);
+        W21_PPG_ave_FFT_Clean(i,:) = abs(PPG_ave_FFT).*WF21;
+        W21_FFTi(i,:) = W21_PPG_ave_FFT_Clean(i,:).^2;
+        
+        
+        W1_PPG_ave_FFT_Clean(i,:) = W1_PPG_ave_FFT_Clean(i,:)/std(W1_PPG_ave_FFT_Clean(i,:)); 
+        W11_PPG_ave_FFT_Clean(i,:) = W11_PPG_ave_FFT_Clean(i,:)/std(W11_PPG_ave_FFT_Clean(i,:)); 
+        W2_PPG_ave_FFT_Clean(i,:) = W2_PPG_ave_FFT_Clean(i,:)/std(W2_PPG_ave_FFT_Clean(i,:)); 
+        W21_PPG_ave_FFT_Clean(i,:) = W21_PPG_ave_FFT_Clean(i,:)/std(W21_PPG_ave_FFT_Clean(i,:)); 
+
+        
+        
+        PPG_ave_FFT_FIN(i,:) = W1_PPG_ave_FFT_Clean(i,:)+ W2_PPG_ave_FFT_Clean(i,:) ; % ensambling W1 & W2
+        
+        hist_int = 25; % We start with +- 25 BPM history tracking window
+        % History tracking
+        if idnb>12
+            % use the estimate of the max_abs_diff after 15 windows ~ 30s
+            if i>15, hist_int = max(abs(diff(BPM_est(1:i-1))))+5; end; 
+        else
+            % use the estimate of the max_abs_diff after 30 windows ~ 60s
+            if i>30, hist_int = max(abs(diff(BPM_est(1:i-1))))+5; end;        
+        end
+        
+        % HR estimation
+        if isempty(rangeIdx)
+            [extra, idx]= max(PPG_ave_FFT_FIN(i,:));
+            BPM_est(i) = FreqRangePPG(idx(1))*60; 
+            rangeIdx = idx(1)-round(hist_int/((FreqRange(2)-FreqRange(1))*60)):idx(1)+round(hist_int/((FreqRange(2)-FreqRange(1))*60));
+        else
+            [extra, idx]= max(PPG_ave_FFT_FIN(i,rangeIdx));
+            BPM_est(i) = FreqRangePPG(rangeIdx(idx(1)))*60; 
+            rangeIdx = rangeIdx(idx(1))-round(hist_int/((FreqRange(2)-FreqRange(1))*60)):rangeIdx(idx(1))+round(hist_int/((FreqRange(2)-FreqRange(1))*60));
+        end
+        rangeIdx(rangeIdx<1) = []; rangeIdx(rangeIdx>length(FreqRange)) = [];
+        
+        
+        % Mild smoothing with linear regression prediction
+        if i>5 && abs(BPM_est(i)-BPM_est(i-1))>5
+            %BPM_est(i) = BPM_est(i-1)+sign(BPM_est(i)-BPM_est(i-1))*10;
+            ddd= polyfit(1:length(BPM_est(max(1,i-5):i-1)),BPM_est(max(1,i-5):i-1),1);
+            BPM_est(i) = 0.8*BPM_est(i)+0.2*polyval(ddd,length(BPM_est(max(1,i-5):i-1))+1);
+        end
+        
+        %Correction for delay
+        mul=0.1;
+        BPM_est(i) = BPM_est(i)+sum(sign(BPM_est(max(2,i-6):i)-BPM_est(max(1,i-7):i-1))*mul);
+
+
+        % 3) Save back mode state
+
+        state_out.W1_FFTi = W1_FFTi;
+        state_out.W11_FFTi = W11_FFTi;
+        state_out.W2_FFTi = W2_FFTi;
+        state_out.W21_FFTi = W21_FFTi;
+        state_out.prevFFT = PPG_ave_FFTpr;
+        state_out.rangeIdx = rangeIdx;
+
+        if fs_adc == fs_hi
+            state_hi = state_out;
+        else
+            state_lo = state_out;
+        end
+
+        % 4) entropy computation +frequency decision 2 state FSM
+        [fs_next, next_state_mode, hi_timer, Hacc(i), dHacc(i), ACCmag25_log(i)] = ...
+            fadc_decision(curDataRaw, fs0, fs_lo, fs_hi, state_mode, i, hi_timer, Hacc, dHacc);
+        fs_adc = fs_next;
+        state_mode = next_state_mode;
+        FsUsed(i) = fs_next;
+
+    end
+    
+    % Code to compute the error
+    if idnb>13
+        load(['Data/True' IDData{idnb}(5:end)]);           % load groundtruth
+    else
+        load(['Data/' IDData{idnb} '_BPMtrace']);           % load groundtruth
+    end
+    frames = min(length(BPM_est), length(BPM0));
+    myError(idnb) = mean(abs(BPM0(1:frames) - BPM_est(1:frames)'));
+
+    % myError(idnb) = mean(abs(BPM0 - BPM_est(1:1:end)'));
+    % myRelError(idnb) = mean(abs(BPM0 - BPM_est(1:1:end)')./BPM0);
+    % myErrorStd(idnb) = std(abs(BPM0 - BPM_est(1:1:end)'));    
+
+    % Store log
+    logRec(idnb).ID = IDData{idnb};
+    logRec(idnb).FsUsed = FsUsed;
+    logRec(idnb).Hacc = Hacc;
+    logRec(idnb).dHacc = dHacc;
+    logRec(idnb).BPM_est = BPM_est(1:frames);
+    logRec(idnb).BPM0 = BPM0(1:frames);
+    logRec(idnb).ACC_mag_25 = ACCmag25_log(1:frames);
+end
+
+% fprintf('\n=== PPG_WFPV_TBME2017 Results ===\n');
+% fprintf('Err12=%2.2f(%2.2f), Err11=%2.2f(%2.2f), ErrAll=%2.2f(%2.2f)\n', mean(myError(1:12)),mean(myErrorStd(1:12)),mean(myError(13:end)),mean(myErrorStd(13:end)),mean(myError),mean(myErrorStd));
+
+% fprintf('Individual recording errors (BPM):');
+% for s=1:allD
+%     if mod(s,5)==1, fprintf('\n  '); end
+%     fprintf('%2.2f ', myError(s));
+% end
+% fprintf('\n\n');
+
+% % other plots
+% fprintf('Generating Bland-Altman plot...\n');
+% BlandAltman(fullBPM0',fullBPM',{'Ground truth HR','Estimated HR'})
+% tmp = corrcoef(fullBPM0,fullBPM); % correlation coefficient, offdiagonal
+% fprintf('Overall correlation coefficient: %.4f\n', tmp(1,2));
+
+
+%% Aggregate metrics
+MAE_all = mean(myError, 'omitnan');
+MAE_train = mean(myError(1:12), 'omitnan');
+MAE_test = mean(myError(13:end), 'omitnan');
+fprintf('\n=== Adaptive Entropy Sampling Results ===\n');
+fprintf('Err12=%2.2f, Err11=%2.2f, ErrAll=%2.2f\n', MAE_train, MAE_test, MAE_all);
+fprintf('Individual recording errors (BPM):\n');
+fprintf(' ');
+fprintf('%4.2f ', myError);
+fprintf('\n');
+
+% Bland-Altman and correlation (aggregate all frames)
+fullBPM0 = [];
+fullBPM = [];
+for rr = 1:numel(logRec)
+    fullBPM0 = [fullBPM0, logRec(rr).BPM0(:)'];
+    fullBPM  = [fullBPM,  logRec(rr).BPM_est(:)'];
+end
+fprintf('Generating Bland-Altman plot...\n');
+[~, figBA] = BlandAltman(fullBPM0', fullBPM', {'Ground truth HR','Estimated HR'});
+if exist('sgtitle','file') && ~isempty(figBA), figure(figBA); sgtitle('Bland-Altman (Adaptive Entropy Sampling)'); end
+tmp = corrcoef(fullBPM0, fullBPM);
+fprintf('Overall correlation coefficient: %.4f\n', tmp(1,2));
+
+% Mode usage stats
+all_fs_used = [logRec.FsUsed];
+pct_hi = 100 * mean(all_fs_used==fs_hi);
+pct_lo = 100 * mean(all_fs_used==fs_lo);
+fprintf('Mode usage: high=%.1f%% low=%.1f%%\n', pct_hi, pct_lo);
+
+% Persist summary logs for later analysis
+save('adaptive_entropy_logs.mat', 'logRec', 'myError', 'MAE_all', 'MAE_train', 'MAE_test');
+
+%% Selected recordings for comparison
+selRecs = [10 17 19];
+for idx = 1:numel(selRecs)
+    r = selRecs(idx);
+    if r <= numel(logRec) && ~isempty(logRec(r).BPM0)
+        win_count = numel(logRec(r).Hacc);
+        frames = 1:win_count;
+
+        % HR comparison and controller signals
+        figure;
+        plot(logRec(r).BPM0,'ro'); hold on; 
+        plot(logRec(r).BPM_est,'o','Color','blue'); 
+        xlabel('Time (frames)'); ylabel('HR (BPM)'); legend({'Ground truth','Estimates'});
+        yyaxis right;
+        plot(logRec(r).Hacc, '--', 'Color', 'green', 'LineWidth', 1.0, 'DisplayName', 'Hacc (25 Hz ACC)');
+        plot(logRec(r).dHacc, '-', 'Color', [0 1 1], 'LineWidth', 1.0, 'DisplayName', 'dHacc (25 Hz ACC)');
+        yline(0.15, ':', 'Color', [0.3 0.3 0.3], 'LineWidth', 1.0, 'DisplayName', 'Ref 0.15');
+        yline(-0.15, ':', 'Color', [0.3 0.3 0.3], 'LineWidth', 1.0, 'DisplayName', 'Ref -0.15');
+        ylabel('Hacc / dHacc');
+        yyaxis left;
+        stairs(frames, logRec(r).FsUsed, '-'); ylabel('FsUsed (Hz)');
+        title(sprintf('Recording %d (Adaptive Entropy Sampling)', r));
+        grid on;
+
+    end
+end
+
+%% Helpers
+function state = init_mode_state()
+% Container for per-mode FFT/Wiener history so HIGH/LOW stay independent
+state.W1_FFTi = [];
+state.W11_FFTi = [];
+state.W2_FFTi = [];
+state.W21_FFTi = [];
+state.prevFFT = [];
+state.rangeIdx = [];
+end
+
+
+
+
+

@@ -1,4 +1,4 @@
-function [BPM_val, state] = simple_hr_one_frame_last(curDataRaw, fs0, fs_adc, fs_proc, FFTres, WFlength, searchHz, state, i, BPM_est, idnb, bpHz)
+function [BPM_val, state] = simple_pd_hr_one_frame(curDataRaw, fs0, fs_adc, fs_proc, FFTres, WFlength, searchHz, state, i, BPM_est, idnb, bpHz)
 % Simple HR estimator: bandpass -> resample -> peak detection in PPG.
 
 % Unused inputs kept for drop-in compatibility.
